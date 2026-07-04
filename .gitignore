@@ -152,3 +152,10 @@ Desktop.ini
 
 fusion_result.json
 kernel_meta/
+
+# Direnv cache
+.direnv/
+
+# Model folder
+hf_model
+
