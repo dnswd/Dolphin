@@ -159,3 +159,6 @@ kernel_meta/
 # Model folder
 hf_model
 
+# Result folder
+results/
+
