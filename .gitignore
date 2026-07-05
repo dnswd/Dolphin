@@ -161,4 +161,7 @@ hf_model
 
 # Result folder
 results/
+parsed_source/
 
+# Source folder
+source/
