@@ -12,6 +12,10 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from utils.utils import *
 
+
+# Force line-buffered stdout so progress is visible in real time
+sys.stdout.reconfigure(line_buffering=True)
+
 FILE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG", ".pdf", ".PDF"]
 DDL = # sql
 '''
@@ -30,6 +34,7 @@ CREATE TABLE IF NOT EXISTS pages (
     FOREIGN KEY (doc_hash) REFERENCES documents (hash) ON DELETE CASCADE
 );
 '''
+
 
 def init_serve():
     raise NotImplementedError("Not yet implemented")  
@@ -60,7 +65,153 @@ def collect_sources(source):
 
     raise FileNotFoundError(f"Unable to determine if {source} is a path or directory")
 
-def init_local(model_path, source_path):
+def configure_document_output_dir(path, hash, output_path):
+    filename = os.path.basename(path)
+    foldername = f"{filename}_{hash}"
+    output_folder = os.path.join(output_path, foldername)
+    os.makedirs(output_folder, exist_ok=True)
+    return output_folder
+
+def process_element_batch(elements, model, prompt, max_batch_size=4):
+    """Process elements of the same type in batches"""
+    results = []
+    
+    # Determine batch size
+    batch_size = len(elements)
+    if max_batch_size is not None and max_batch_size > 0:
+        batch_size = min(batch_size, max_batch_size)
+    
+    # Process in batches
+    for i in range(0, len(elements), batch_size):
+        batch_elements = elements[i:i+batch_size]
+        crops_list = [elem["crop"] for elem in batch_elements]
+        
+        # Use the same prompt for all elements in the batch
+        prompts_list = [prompt] * len(crops_list)
+        
+        # Batch inference
+        batch_results = model.chat(prompts_list, crops_list)
+        
+        # Add results
+        for j, result in enumerate(batch_results):
+            elem = batch_elements[j]
+            results.append({
+                "label": elem["label"],
+                "bbox": elem["bbox"],
+                "text": result.strip(),
+                "reading_order": elem["reading_order"],
+                "tags": elem["tags"],
+            })
+    
+    return results
+
+def process_elements(layout_results, image, model, save_dir, image_name):
+    """Parse all document elements with parallel decoding"""
+    layout_results_list = parse_layout_string(layout_results)
+    if not layout_results_list or not (layout_results.startswith("[") and layout_results.endswith("]")):
+        layout_results_list = [([0, 0, *image.size], 'distorted_page', [])]
+    # Check for bbox overlap - if too many overlaps, treat as distorted page
+    elif len(layout_results_list) > 1 and check_bbox_overlap(layout_results_list, image):
+        print("Falling back to distorted_page mode due to high bbox overlap", flush=True)
+        layout_results_list = [([0, 0, *image.size], 'distorted_page', [])]
+        
+    tab_elements = []      
+    equ_elements = []     
+    code_elements = []    
+    text_elements = []     
+    figure_results = []    
+    reading_order = 0
+
+    # Collect elements and group
+    for bbox, label, tags in layout_results_list:
+        try:
+            if label == "distorted_page":
+                x1, y1, x2, y2 = 0, 0, *image.size
+                pil_crop = image
+            else:
+                # get coordinates in the original image
+                x1, y1, x2, y2 = process_coordinates(bbox, image)
+                # crop the image
+                pil_crop = image.crop((x1, y1, x2, y2))
+
+            if pil_crop.size[0] > 3 and pil_crop.size[1] > 3:
+                if label == "fig":
+                    figure_filename = save_figure_to_local(pil_crop, save_dir, image_name, reading_order)
+                    figure_results.append({
+                        "label": label,
+                        "text": f"![Figure](figures/{figure_filename})",
+                        "figure_path": f"figures/{figure_filename}",
+                        "bbox": [x1, y1, x2, y2],
+                        "reading_order": reading_order,
+                        "tags": tags,
+                    })
+                else:
+                    # Prepare element information
+                    element_info = {
+                        "crop": pil_crop,
+                        "label": label,
+                        "bbox": [x1, y1, x2, y2],
+                        "reading_order": reading_order,
+                        "tags": tags,
+                    }
+                    
+                    if label == "tab":
+                        tab_elements.append(element_info)
+                    elif label == "equ":
+                        equ_elements.append(element_info)
+                    elif label == "code":
+                        code_elements.append(element_info)
+                    else:
+                        text_elements.append(element_info)
+
+            reading_order += 1
+
+        except Exception as e:
+            print(f"Error processing bbox with label {label}: {str(e)}", flush=True)
+            continue
+
+    recognition_results = figure_results.copy()
+    
+    if tab_elements:
+        results = process_element_batch(tab_elements, model, "Parse the table in the image.")
+        recognition_results.extend(results)
+    
+    if equ_elements:
+        results = process_element_batch(equ_elements, model, "Read formula in the image.")
+        recognition_results.extend(results)
+    
+    if code_elements:
+        results = process_element_batch(code_elements, model, "Read code in the image.")
+        recognition_results.extend(results)
+    
+    if text_elements:
+        results = process_element_batch(text_elements, model, "Read text in the image.")
+        recognition_results.extend(results)
+
+    recognition_results.sort(key=lambda x: x.get("reading_order", 0))
+
+    return recognition_results
+
+def process_image_document(model, path, hash, output_dir):
+    pil = Image.open(path).convert("RGB")
+
+    # layout calculation
+    layout_output = model.chat("Parse the reading order of this document.", pil)
+
+    # parse elements
+    parsed_elements = process_elements(layout_output, pil, model, output_dir, os.splitext(path)[0])
+    
+
+def process_document(model, path, hash, output_path):
+    output_dir = configure_document_output_dir(path, hash, output_path)
+    file_ext = os.path.splitext(path)[1].lower()
+    
+    if file_ext == '.pdf':
+        return
+    else: # image
+        return
+
+def init_local(model_path, source_path, output_path):
     documents = collect_sources(source_path)
     paths = [os.path.abspath(doc[0]) for doc in documents]
     width = max(len(p) for p in paths) if paths else 0
@@ -69,8 +220,13 @@ def init_local(model_path, source_path):
     for path, (_, md5) in zip(paths, documents):
         print(f"{path:<{width}}  (md5:{md5})", flush=True)
 
-    print(f"\nLoading model from {os.path.abspath(model_path)}\n")
+    print(f"\nLoading model from {os.path.abspath(model_path)}\n", flush=True)
     model = DOLPHIN(model_path)
+    print(f"\nModel loaded successfully\n", flush=True)
+
+    for (path, hash) in documents:
+        process_document(model, path, hash, output_path)
+
     return True
 
 class DB:
@@ -260,6 +416,7 @@ def main():
 
     local = sub.add_parser("local", parents=[common])
     local.add_argument("path", type=Path, nargs="?", default=Path("./source"), help="Path to file/folder with files in it")
+    local.add_argument("--output", type=Path, nargs="?", default=Path("./out"), help="Path to folder to output")
 
     serve = sub.add_parser("serve", parents=[common])
     serve.add_argument("--host", default="0.0.0.0", help="Default to 0.0.0.0")
@@ -269,10 +426,11 @@ def main():
     db = DB()
     try:
         args = parser.parse_args()
+        os.makedirs(args.output, exist_ok=True)
         if (args.command == "serve"):
             return init_serve()
         else:
-            return init_local(args.model_path, args.path)
+            return init_local(args.model_path, args.path, args.output)
     finally:
         db.close()
 
